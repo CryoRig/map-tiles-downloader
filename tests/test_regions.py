@@ -1,5 +1,8 @@
+import json
+import tempfile
+from pathlib import Path
 from unittest.mock import patch, MagicMock
-from map_tiles_downloader.regions import _parse_country_bbox, load_region_catalog
+from map_tiles_downloader.regions import _parse_country_bbox, _load_admin1_names, load_region_catalog
 
 
 class TestParseCountryBbox:
@@ -27,6 +30,62 @@ class TestParseCountryBbox:
         country = {"bbox": {"west": "invalid", "south": 35.0, "east": 5.0, "north": 45.0}}
         result = _parse_country_bbox(country)
         assert result is None
+
+
+class TestLoadAdmin1Names:
+    def test_returns_empty_dict_when_file_missing(self, tmp_path):
+        import map_tiles_downloader.regions as regions_mod
+
+        original = regions_mod._ADMIN1_NAMES_FILE
+        try:
+            regions_mod._ADMIN1_NAMES_FILE = tmp_path / "nonexistent.json"
+            result = _load_admin1_names()
+            assert result == {}
+        finally:
+            regions_mod._ADMIN1_NAMES_FILE = original
+
+    def test_loads_valid_json_file(self, tmp_path):
+        import map_tiles_downloader.regions as regions_mod
+
+        data = {"US.CA": "California", "PL.78": "Mazowieckie"}
+        json_file = tmp_path / "admin1_names.json"
+        json_file.write_text(json.dumps(data), encoding="utf-8")
+
+        original = regions_mod._ADMIN1_NAMES_FILE
+        try:
+            regions_mod._ADMIN1_NAMES_FILE = json_file
+            result = _load_admin1_names()
+            assert result == {"US.CA": "California", "PL.78": "Mazowieckie"}
+        finally:
+            regions_mod._ADMIN1_NAMES_FILE = original
+
+    def test_returns_empty_dict_on_corrupt_json(self, tmp_path):
+        import map_tiles_downloader.regions as regions_mod
+
+        json_file = tmp_path / "admin1_names.json"
+        json_file.write_text("NOT VALID JSON {{{", encoding="utf-8")
+
+        original = regions_mod._ADMIN1_NAMES_FILE
+        try:
+            regions_mod._ADMIN1_NAMES_FILE = json_file
+            result = _load_admin1_names()
+            assert result == {}
+        finally:
+            regions_mod._ADMIN1_NAMES_FILE = original
+
+    def test_returns_empty_dict_when_content_is_not_a_dict(self, tmp_path):
+        import map_tiles_downloader.regions as regions_mod
+
+        json_file = tmp_path / "admin1_names.json"
+        json_file.write_text(json.dumps(["list", "not", "dict"]), encoding="utf-8")
+
+        original = regions_mod._ADMIN1_NAMES_FILE
+        try:
+            regions_mod._ADMIN1_NAMES_FILE = json_file
+            result = _load_admin1_names()
+            assert result == {}
+        finally:
+            regions_mod._ADMIN1_NAMES_FILE = original
 
 
 class TestLoadRegionCatalog:
@@ -247,6 +306,73 @@ class TestLoadRegionCatalog:
         # Should have "All of Monaco" as fallback
         assert "All of Monaco" in monaco_states
         assert monaco_states["All of Monaco"] == (43.7, 7.4, 43.8, 7.4)
+
+    @patch("map_tiles_downloader.regions._load_admin1_names")
+    @patch("map_tiles_downloader.regions.geonamescache")
+    def test_admin1_names_used_for_region_display(self, mock_geonamescache, mock_load_names):
+        """Bundled admin1_names.json provides proper names instead of raw codes."""
+        mock_gc = MagicMock()
+        mock_geonamescache.GeonamesCache.return_value = mock_gc
+
+        mock_gc.get_continents.return_value = {"EU": {"name": "Europe"}}
+        mock_gc.get_countries.return_value = {
+            "PL": {
+                "continentcode": "EU",
+                "name": "Poland",
+                "iso": "PL",
+                "bbox": {"west": 14.0, "south": 49.0, "east": 24.0, "north": 55.0},
+            }
+        }
+        mock_gc.get_subdivisions = None  # simulate older geonamescache without this method
+
+        # Cities that produce two Polish admin1 bboxes (codes "72" and "78")
+        mock_gc.get_cities.return_value = {
+            "1": {"countrycode": "PL", "admin1code": "72", "latitude": "51.1", "longitude": "17.0"},
+            "2": {"countrycode": "PL", "admin1code": "78", "latitude": "52.2", "longitude": "21.0"},
+        }
+
+        # Provide admin1 names as if loaded from admin1_names.json
+        mock_load_names.return_value = {
+            "PL.72": "Dolnośląskie",
+            "PL.78": "Mazowieckie",
+        }
+
+        catalog = load_region_catalog()
+
+        pl_regions = catalog["Europe"]["Poland"]
+        assert "Dolnośląskie" in pl_regions, "PL.72 should display as 'Dolnośląskie'"
+        assert "Mazowieckie" in pl_regions, "PL.78 should display as 'Mazowieckie'"
+        # Raw numeric codes must NOT appear as region names
+        assert "72" not in pl_regions
+        assert "78" not in pl_regions
+
+    @patch("map_tiles_downloader.regions._load_admin1_names")
+    @patch("map_tiles_downloader.regions.geonamescache")
+    def test_raw_code_fallback_when_name_missing(self, mock_geonamescache, mock_load_names):
+        """When no name is found, the raw admin1 code is still used as a fallback."""
+        mock_gc = MagicMock()
+        mock_geonamescache.GeonamesCache.return_value = mock_gc
+
+        mock_gc.get_continents.return_value = {"EU": {"name": "Europe"}}
+        mock_gc.get_countries.return_value = {
+            "XY": {
+                "continentcode": "EU",
+                "name": "Testland",
+                "iso": "XY",
+            }
+        }
+        mock_gc.get_subdivisions = None
+        mock_gc.get_cities.return_value = {
+            "1": {"countrycode": "XY", "admin1code": "99", "latitude": "50.0", "longitude": "10.0"},
+        }
+        # admin1_names.json has no entry for XY.99
+        mock_load_names.return_value = {}
+
+        catalog = load_region_catalog()
+
+        xy_regions = catalog["Europe"]["Testland"]
+        # The raw code "99" should appear as the region name
+        assert "99" in xy_regions
 
 
 class TestRegionCatalogStructure:
